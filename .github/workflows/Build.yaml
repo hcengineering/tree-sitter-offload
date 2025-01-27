@@ -68,3 +68,7 @@ jobs:
     - name: Build jar
       working-directory: ./tree-sitter-ng/
       run: ./gradlew :tree-sitter:build
+    - uses: actions/upload-artifact@v4
+      with:
+        name: jar
+        path: tree-sitter-ng/build/libs/tree-sitter-*.jar
