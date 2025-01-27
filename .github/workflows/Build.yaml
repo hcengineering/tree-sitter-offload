@@ -71,4 +71,4 @@ jobs:
     - uses: actions/upload-artifact@v4
       with:
         name: jar
-        path: tree-sitter-ng/build/libs/tree-sitter-*.jar
+        path: tree-sitter-ng/tree-sitter/build/libs/tree-sitter-*.jar
