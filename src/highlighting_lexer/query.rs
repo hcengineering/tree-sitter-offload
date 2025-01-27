@@ -3,7 +3,6 @@ use std::{
     collections::HashMap,
     ops::{Deref, Range},
     sync::Arc,
-    usize,
 };
 
 use jni::{
@@ -14,7 +13,7 @@ use jni::{
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{
     ffi::{self, TSTree},
-    Node, Query, QueryCursor, TextProvider, Tree,
+    Node, Query, QueryCursor, TextProvider, Tree, TreeCursor,
 };
 
 use crate::language_registry::{LanguageId, LANGUAGE_REGISTRY};
@@ -73,19 +72,59 @@ impl<'a> TextProvider<Vec<u8>> for RecodingUtf16TextProvider<'a> {
     }
 }
 
-pub fn highlight_tokens_cover(
+// Find start byte of minimal token cover of range
+// Returns (cover_start_byte, parent_stack, tree_cursor)
+fn find_cover_start<'tree>(
+    tree: &'tree Tree,
+    byte_start: usize,
+) -> (usize, Vec<(usize, Range<usize>)>, TreeCursor<'tree>) {
+    let root = tree.root_node();
+    let mut tree_cursor = root.walk();
+    let mut parent_stack = Vec::new();
+    loop {
+        let node = tree_cursor.node();
+        parent_stack.push((node.id(), node.start_byte()..node.end_byte()));
+        if tree_cursor.goto_first_child_for_byte(byte_start).is_none() {
+            break;
+        }
+    }
+    debug_assert_eq!(
+        parent_stack.last().map(|(node_id, _)| *node_id),
+        Some(tree_cursor.node().id())
+    );
+    let mut cover_start_byte = tree_cursor.node().start_byte();
+    while cover_start_byte > byte_start {
+        // Need to extend cover to the left, but
+        // there is no node between cover_start and current node
+        if tree_cursor.goto_previous_sibling() {
+            let node = tree_cursor.node();
+            *parent_stack
+                .last_mut()
+                .expect("has stack entries if has previous sibling") =
+                (node.id(), node.start_byte()..node.end_byte());
+            cover_start_byte = tree_cursor.node().end_byte();
+        } else if tree_cursor.goto_parent() {
+            parent_stack.pop();
+            cover_start_byte = tree_cursor.node().start_byte();
+        } else {
+            // start of the file, no nodes before start of range
+            cover_start_byte = 0;
+        }
+    }
+    debug_assert!(cover_start_byte <= byte_start);
+    (cover_start_byte, parent_stack, tree_cursor)
+}
+
+fn collect_highlights_for_range(
     tree: &Tree,
     query: &Query,
     text: &[u16],
-    range: Range<usize>,
-) -> (usize, Vec<HighlightToken>) {
+    byte_range: Range<usize>,
+) -> HashMap<Range<usize>, (u16, usize)> {
     let mut query_cursor = QueryCursor::new();
-    let byte_start = range.start * 2;
-    let byte_end = range.end * 2;
-    query_cursor.set_byte_range(byte_start..byte_end);
-    let root = tree.root_node();
+    query_cursor.set_byte_range(byte_range);
     let text_provider = RecodingUtf16TextProvider { text };
-    let mut captures = query_cursor.captures(query, root, text_provider);
+    let mut captures = query_cursor.captures(query, tree.root_node(), text_provider);
     let mut highlights: HashMap<Range<usize>, (u16, usize)> = HashMap::new();
     while let Some((next_match, cidx)) = captures.next() {
         let capture = next_match.captures[*cidx];
@@ -98,8 +137,29 @@ pub fn highlight_tokens_cover(
         }
         highlights.insert(range, (capture_id, next_match.pattern_index));
     }
+    highlights
+}
 
-    let mut highlight_stack: Vec<(usize, u16)> = Vec::new();
+pub fn highlight_tokens_cover(
+    tree: &Tree,
+    query: &Query,
+    text: &[u16],
+    range: Range<usize>,
+) -> (usize, Vec<HighlightToken>) {
+    let (byte_start, parent_stack, mut tree_cursor) = find_cover_start(&tree, range.start * 2);
+    let byte_end = range.end * 2;
+
+    let highlights = collect_highlights_for_range(tree, query, text, byte_start..byte_end);
+
+    let mut highlight_stack: Vec<(usize, u16)> = parent_stack
+        .into_iter()
+        .filter_map(|(node_id, range)| {
+            highlights
+                .get(&range)
+                .map(|(capture_id, _)| (node_id, *capture_id))
+        })
+        .collect();
+
     let mut highlight_tokens: Vec<HighlightToken> = Vec::new();
     let token_from_node = |node: Node<'_>, highlight_stack: &[(usize, u16)]| HighlightToken {
         kind_id: node.kind_id(),
@@ -110,35 +170,24 @@ pub fn highlight_tokens_cover(
         length: ((node.end_byte() - node.start_byte()) / 2) as u32,
     };
     let token_from_node_subrange =
-        |node: Node<'_>, range: Range<usize>, highlight_stack: &[(usize, u16)]| HighlightToken {
-            kind_id: node.kind_id(),
+        |range: Range<usize>, highlight_stack: &[(usize, u16)]| HighlightToken {
+            kind_id: u16::MAX,
             capture_id: highlight_stack
                 .last()
                 .map(|(_, capture_id)| *capture_id)
                 .unwrap_or(u16::MAX),
             length: ((range.end - range.start) / 2) as u32,
         };
-    let mut tree_cursor = root.walk();
-    loop {
-        let node_id = tree_cursor.node().id();
-        let range = tree_cursor.node().start_byte()..tree_cursor.node().end_byte();
-        if let Some((capture_id, _)) = highlights.get(&range).copied() {
-            highlight_stack.push((node_id, capture_id));
-        }
-        if tree_cursor.goto_first_child_for_byte(byte_start).is_none() {
-            break;
-        }
-    }
-    let actual_byte_start = tree_cursor.node().start_byte();
-    let mut byte_current = actual_byte_start;
+
+    let mut byte_current = byte_start;
     while byte_current < byte_end {
         let node = tree_cursor.node();
         let node_id = node.id();
+        debug_assert!(byte_current >= node.start_byte());
         if byte_current < node.end_byte() {
             if tree_cursor.goto_first_child() {
                 if tree_cursor.node().start_byte() > byte_current {
                     highlight_tokens.push(token_from_node_subrange(
-                        node,
                         byte_current..tree_cursor.node().start_byte(),
                         &highlight_stack,
                     ));
@@ -155,19 +204,14 @@ pub fn highlight_tokens_cover(
                 byte_current = node.end_byte();
             }
         } else {
-            if let Some((highlight_id, _)) = highlight_stack.last() {
-                if node_id == *highlight_id {
+            if let Some((highlight_node_id, _)) = highlight_stack.last() {
+                if node_id == *highlight_node_id {
                     highlight_stack.pop();
                 }
             }
             if tree_cursor.goto_next_sibling() {
                 if tree_cursor.node().start_byte() > byte_current {
-                    let parent = tree_cursor
-                        .node()
-                        .parent()
-                        .expect("common parent with a sibling");
                     highlight_tokens.push(token_from_node_subrange(
-                        parent,
                         byte_current..tree_cursor.node().start_byte(),
                         &highlight_stack,
                     ));
@@ -182,7 +226,6 @@ pub fn highlight_tokens_cover(
             } else if tree_cursor.goto_parent() {
                 if tree_cursor.node().end_byte() > byte_current {
                     highlight_tokens.push(token_from_node_subrange(
-                        tree_cursor.node(),
                         byte_current..tree_cursor.node().end_byte(),
                         &highlight_stack,
                     ));
@@ -193,7 +236,7 @@ pub fn highlight_tokens_cover(
             }
         }
     }
-    (actual_byte_start / 2, highlight_tokens)
+    (byte_start / 2, highlight_tokens)
 }
 
 #[no_mangle]
