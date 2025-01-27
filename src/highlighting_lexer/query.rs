@@ -185,7 +185,7 @@ pub fn highlight_tokens_cover(
             }
         }
     }
-    (actual_byte_start, highlight_tokens)
+    (actual_byte_start / 2, highlight_tokens)
 }
 
 #[no_mangle]
