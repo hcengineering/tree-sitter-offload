@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build
+      run: cargo build --release
+    - uses: actions/upload-artifact@v4
+      with:
+        name: cdylib-linux
+        path: target/release/*.so
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build
+      run: cargo build --release
+    - uses: actions/upload-artifact@v4
+      with:
+        name: cdylib-macos
+        path: target/release/*.dylib
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build
+      run: cargo build --release
+    - uses: actions/upload-artifact@v4
+      with:
+        name: cdylib-windows
+        path: target/release/*.dll
+
+  build-jar:
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-windows, build-macos]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: actions/download-artifact@v4
+      with:
+        path: dylibs
+        pattern: cdylib-*
+        merge-multiple: true
+    - name: Copy libs
+      run: |
+        rm -f tree-sitter-ng/tree-sitter/src/main/resources/lib/*
+        cp dylibs/libtree_sitter_offload.so tree-sitter-ng/tree-sitter/src/main/resources/lib/x86_64-linux-gnu-tree-sitter.so
+        cp dylibs/libtree_sitter_offload.dylib tree-sitter-ng/tree-sitter/src/main/resources/lib/aarch64-macos-tree-sitter.dylib
+        cp dylibs/tree_sitter_offload.dll tree-sitter-ng/tree-sitter/src/main/resources/lib/x86_64-windows-tree-sitter.dll
+    - name: Build jar
+      working-directory: ./tree-sitter-ng/
+      run: ./gradlew :tree-sitter:build
