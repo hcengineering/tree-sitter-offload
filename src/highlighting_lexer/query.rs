@@ -1,6 +1,6 @@
 use std::{
+    char,
     collections::HashMap,
-    iter::Peekable,
     ops::{Deref, Range},
     sync::Arc,
     usize,
@@ -23,48 +23,52 @@ use super::HighlightToken;
 
 struct RecodingUtf16TextProvider<'a> {
     text: &'a [u16],
-    buffer: &'a [u8; 64],
 }
 
-struct RecodingUtf16TextProviderIterator<'a, I: Iterator<Item = char>> {
-    iterator: Peekable<I>,
-    buffer: &'a [u8; 64],
-    buffer_written: usize,
+struct RecodingUtf16TextProviderIterator<'a> {
+    text: &'a [u16],
+    start_offset: usize,
+    end_offset: usize,
+    ended: bool,
 }
 
-impl<'a, I: Iterator<Item = char>> Iterator for RecodingUtf16TextProviderIterator<'a, I> {
-    type Item = &'a [u8];
+impl<'a> Iterator for RecodingUtf16TextProviderIterator<'a> {
+    type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(c) = self.iterator.peek() {
-            if self.buffer_written + char::len_utf8(*c) > self.buffer.len() {
-                return Some(&self.buffer[..self.buffer_written]);
-            } else {
-                let _ = self.iterator.next();
-            }
+        if self.ended {
+            return None;
         }
-        if self.buffer_written > 0 {
-            Some(&self.buffer[..self.buffer_written])
-        } else {
-            None
+        // Expect mostly ascii
+        let mut buf = Vec::with_capacity(self.end_offset - self.start_offset);
+        let mut char_buf = [0u8; 4];
+        for c in char::decode_utf16(
+            self.text[self.start_offset..self.end_offset]
+                .iter()
+                .copied(),
+        ) {
+            let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+            let c_len = c.len_utf8();
+            c.encode_utf8(&mut char_buf);
+            buf.extend_from_slice(&char_buf[0..c_len]);
         }
+        self.ended = true;
+        Some(buf)
     }
 }
 
-impl<'a> TextProvider<&'a [u8]> for RecodingUtf16TextProvider<'a> {
-    type I = RecodingUtf16TextProviderIterator<'a, Box<dyn Iterator<Item = char> + 'a>>;
+impl<'a> TextProvider<Vec<u8>> for RecodingUtf16TextProvider<'a> {
+    type I = RecodingUtf16TextProviderIterator<'a>;
 
     fn text(&mut self, node: Node) -> Self::I {
         let start_offset = node.start_byte() / 2;
         let end_offset = node.end_byte() / 2;
 
-        let char_iterator = char::decode_utf16(self.text[start_offset..end_offset].iter().copied())
-            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER));
-        let char_iterator: Box<dyn Iterator<Item = char> + 'a> = Box::new(char_iterator);
         RecodingUtf16TextProviderIterator {
-            iterator: char_iterator.peekable(),
-            buffer: self.buffer,
-            buffer_written: 0,
+            text: self.text,
+            start_offset,
+            end_offset,
+            ended: false,
         }
     }
 }
@@ -80,18 +84,19 @@ pub fn highlight_tokens_cover(
     let byte_end = range.end * 2;
     query_cursor.set_byte_range(byte_start..byte_end);
     let root = tree.root_node();
-    let text_buffer = Box::new([0u8; 64]);
-    let text_provider = RecodingUtf16TextProvider {
-        text,
-        buffer: &text_buffer,
-    };
+    let text_provider = RecodingUtf16TextProvider { text };
     let mut captures = query_cursor.captures(query, root, text_provider);
-    let mut highlights: HashMap<usize, u16> = HashMap::new();
+    let mut highlights: HashMap<Range<usize>, (u16, usize)> = HashMap::new();
     while let Some((next_match, cidx)) = captures.next() {
         let capture = next_match.captures[*cidx];
-        let node_id = capture.node.id();
+        let range = capture.node.start_byte()..capture.node.end_byte();
         let capture_id = capture.index as u16;
-        highlights.insert(node_id, capture_id);
+        if let Some((_, pattern_index)) = highlights.get(&range) {
+            if next_match.pattern_index < *pattern_index {
+                continue;
+            }
+        }
+        highlights.insert(range, (capture_id, next_match.pattern_index));
     }
 
     let mut highlight_stack: Vec<(usize, u16)> = Vec::new();
@@ -116,7 +121,8 @@ pub fn highlight_tokens_cover(
     let mut tree_cursor = root.walk();
     loop {
         let node_id = tree_cursor.node().id();
-        if let Some(capture_id) = highlights.get(&node_id).copied() {
+        let range = tree_cursor.node().start_byte()..tree_cursor.node().end_byte();
+        if let Some((capture_id, _)) = highlights.get(&range).copied() {
             highlight_stack.push((node_id, capture_id));
         }
         if tree_cursor.goto_first_child_for_byte(byte_start).is_none() {
@@ -140,7 +146,8 @@ pub fn highlight_tokens_cover(
                 }
                 let node = tree_cursor.node();
                 let node_id = node.id();
-                if let Some(capture_id) = highlights.get(&node_id).copied() {
+                let range = node.start_byte()..node.end_byte();
+                if let Some((capture_id, _)) = highlights.get(&range).copied() {
                     highlight_stack.push((node_id, capture_id));
                 }
             } else {
@@ -168,7 +175,8 @@ pub fn highlight_tokens_cover(
                 }
                 let node = tree_cursor.node();
                 let node_id = node.id();
-                if let Some(capture_id) = highlights.get(&node_id).copied() {
+                let range = node.start_byte()..node.end_byte();
+                if let Some((capture_id, _)) = highlights.get(&range).copied() {
                     highlight_stack.push((node_id, capture_id));
                 }
             } else if tree_cursor.goto_parent() {
