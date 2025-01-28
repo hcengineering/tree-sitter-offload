@@ -93,7 +93,7 @@ fn find_cover_start<'tree>(
         Some(tree_cursor.node().id())
     );
     let mut cover_start_byte = tree_cursor.node().start_byte();
-    while cover_start_byte > byte_start {
+    while cover_start_byte >= byte_start {
         // Need to extend cover to the left, but
         // there is no node between cover_start and current node
         if tree_cursor.goto_previous_sibling() {
@@ -109,6 +109,7 @@ fn find_cover_start<'tree>(
         } else {
             // start of the file, no nodes before start of range
             cover_start_byte = 0;
+            break;
         }
     }
     debug_assert!(cover_start_byte <= byte_start);
