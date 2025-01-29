@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     mem::transmute,
     ops::{Deref, DerefMut},
     str,
@@ -17,6 +18,10 @@ use jni::{
 };
 use tree_sitter::Query;
 
+use crate::predicates::{
+    AdditionalPredicates, ContainsPredicateParser, PredicateParser,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct LanguageId(jlong);
@@ -32,7 +37,7 @@ impl LanguageId {
 }
 
 pub struct LanguageParserInfo {
-    pub(crate) highlights_query: Option<Arc<tree_sitter::Query>>,
+    pub(crate) highlights_query: Option<Arc<(tree_sitter::Query, AdditionalPredicates)>>,
 }
 
 pub struct Language {
@@ -111,6 +116,15 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
     id
 }
 
+thread_local! {
+    static PREDICATE_PARSER: HashMap<&'static str, Box<dyn PredicateParser>> = HashMap::from([
+        ("contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+        ("not-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+        ("any-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+        ("any-not-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+    ]);
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLanguageRegistry_nativeAddHighlightQuery<
     'local,
@@ -155,7 +169,21 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
             return JObjectArray::default();
         }
     };
-    let query = Arc::new(query);
+    let additional_predicates = match PREDICATE_PARSER
+        .with(|parser| AdditionalPredicates::parse(&query, query_str, parser))
+    {
+        Ok(predicates) => predicates,
+        Err(err) => {
+            env.throw_new(
+                "java/lang/RuntimeException",
+                format!("Failed to parse query: {err}"),
+            )
+            .unwrap();
+            return JObjectArray::default();
+        }
+    };
+
+    let query = Arc::new((query, additional_predicates));
     LANGUAGE_REGISTRY
         .write()
         .unwrap()
@@ -163,7 +191,7 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
         .expect("already checked that language exists")
         .parser_info_mut()
         .highlights_query = Some(Arc::clone(&query));
-    let capture_names = query.capture_names();
+    let capture_names = query.0.capture_names();
     let capture_names_array = env
         .new_object_array(
             capture_names.len() as jsize,

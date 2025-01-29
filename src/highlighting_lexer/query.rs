@@ -16,7 +16,7 @@ use tree_sitter::{
     Node, Query, QueryCursor, TextProvider, Tree, TreeCursor,
 };
 
-use crate::language_registry::{LanguageId, LANGUAGE_REGISTRY};
+use crate::{predicates::AdditionalPredicates, language_registry::{LanguageId, LANGUAGE_REGISTRY}};
 
 use super::HighlightToken;
 
@@ -118,16 +118,21 @@ fn find_cover_start<'tree>(
 
 fn collect_highlights_for_range(
     tree: &Tree,
-    query: &Query,
+    query: &(Query, AdditionalPredicates),
     text: &[u16],
     byte_range: Range<usize>,
 ) -> HashMap<Range<usize>, (u16, usize)> {
     let mut query_cursor = QueryCursor::new();
     query_cursor.set_byte_range(byte_range);
     let text_provider = RecodingUtf16TextProvider { text };
-    let mut captures = query_cursor.captures(query, tree.root_node(), text_provider);
+    let mut text_provider2 = RecodingUtf16TextProvider { text };
+    let mut captures = query_cursor.captures(&query.0, tree.root_node(), text_provider);
     let mut highlights: HashMap<Range<usize>, (u16, usize)> = HashMap::new();
     while let Some((next_match, cidx)) = captures.next() {
+        if !query.1.satisfies_predicates(&mut text_provider2, next_match) {
+            next_match.remove();
+            continue;
+        }
         let capture = next_match.captures[*cidx];
         let range = capture.node.start_byte()..capture.node.end_byte();
         let capture_id = capture.index as u16;
@@ -143,7 +148,7 @@ fn collect_highlights_for_range(
 
 pub fn highlight_tokens_cover(
     tree: &Tree,
-    query: &Query,
+    query: &(Query, AdditionalPredicates),
     text: &[u16],
     range: Range<usize>,
 ) -> (usize, Vec<HighlightToken>) {

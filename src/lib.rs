@@ -2,6 +2,7 @@ use std::{ffi::c_void, sync::OnceLock};
 
 use jni::{sys::jint, JavaVM};
 
+mod predicates;
 mod highlighting_lexer;
 mod language_registry;
 
