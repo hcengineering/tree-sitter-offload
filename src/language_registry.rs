@@ -113,7 +113,7 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
 }
 
 #[derive(Debug)]
-enum LanguageError {
+pub enum LanguageError {
     InvalidLanguageId,
 }
 
