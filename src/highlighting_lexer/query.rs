@@ -16,7 +16,10 @@ use tree_sitter::{
     Node, Query, QueryCursor, TextProvider, Tree, TreeCursor,
 };
 
-use crate::{predicates::AdditionalPredicates, language_registry::{LanguageId, LANGUAGE_REGISTRY}};
+use crate::{
+    language_registry::{with_language, LanguageId},
+    predicates::AdditionalPredicates,
+};
 
 use super::HighlightToken;
 
@@ -129,7 +132,10 @@ fn collect_highlights_for_range(
     let mut captures = query_cursor.captures(&query.0, tree.root_node(), text_provider);
     let mut highlights: HashMap<Range<usize>, (u16, usize)> = HashMap::new();
     while let Some((next_match, cidx)) = captures.next() {
-        if !query.1.satisfies_predicates(&mut text_provider2, next_match) {
+        if !query
+            .1
+            .satisfies_predicates(&mut text_provider2, next_match)
+        {
             next_match.remove();
             continue;
         }
@@ -269,17 +275,16 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeHighli
     let mut text_buffer = vec![0u16; text_length as usize];
     env.get_char_array_region(&text, 0, &mut text_buffer)
         .unwrap();
-    let query = {
-        let registry = LANGUAGE_REGISTRY.read().unwrap();
-        let Some(language) = registry.language(language_id) else {
-            return JObject::null();
-        };
-        let query = language
+    let Ok(query) = with_language(language_id, |language| {
+        language
             .parser_info()
             .highlights_query
             .as_ref()
-            .map(Arc::clone);
-        query
+            .map(Arc::clone)
+    }) else {
+        env.throw_new("java/lang/IllegalArgumentException", "invalid language id")
+            .unwrap();
+        return JObject::null();
     };
     let Some(query) = query else {
         return JObject::null();

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, marker::PhantomData, ops::Deref};
 
 use tree_sitter::{
-    Node, Query, QueryError, QueryErrorKind,
-    QueryMatch, QueryPredicate, QueryPredicateArg, TextProvider,
+    Node, Query, QueryError, QueryErrorKind, QueryMatch, QueryPredicate, QueryPredicateArg,
+    TextProvider,
 };
 
 const fn predicate_error(row: usize, message: String) -> QueryError {
@@ -235,4 +235,13 @@ impl AdditionalPredicates {
         }
         true
     }
+}
+
+thread_local! {
+    pub(crate) static PREDICATE_PARSER: HashMap<&'static str, Box<dyn PredicateParser>> = HashMap::from([
+        ("contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+        ("not-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+        ("any-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+        ("any-not-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
+    ]);
 }

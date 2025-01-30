@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     mem::transmute,
     ops::{Deref, DerefMut},
     str,
@@ -18,17 +17,14 @@ use jni::{
 };
 use tree_sitter::Query;
 
-use crate::predicates::{
-    AdditionalPredicates, ContainsPredicateParser, PredicateParser,
-};
+use crate::predicates::{AdditionalPredicates, PREDICATE_PARSER};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct LanguageId(jlong);
 
 static LANGUAGE_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
-pub(crate) static LANGUAGE_REGISTRY: LazyLock<RwLock<LanguageRegistry>> =
-    LazyLock::new(|| RwLock::default());
+static LANGUAGE_REGISTRY: LazyLock<RwLock<LanguageRegistry>> = LazyLock::new(|| RwLock::default());
 
 impl LanguageId {
     fn new() -> LanguageId {
@@ -116,13 +112,20 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
     id
 }
 
-thread_local! {
-    static PREDICATE_PARSER: HashMap<&'static str, Box<dyn PredicateParser>> = HashMap::from([
-        ("contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
-        ("not-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
-        ("any-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
-        ("any-not-contains?", Box::new(ContainsPredicateParser) as Box<dyn PredicateParser>),
-    ]);
+#[derive(Debug)]
+enum LanguageError {
+    InvalidLanguageId,
+}
+
+pub fn with_language<T>(
+    language_id: LanguageId,
+    f: impl FnOnce(&Language) -> T,
+) -> Result<T, LanguageError> {
+    let registry = LANGUAGE_REGISTRY.read().unwrap();
+    let language = registry
+        .language(language_id)
+        .ok_or(LanguageError::InvalidLanguageId)?;
+    Ok(f(language))
 }
 
 #[no_mangle]
@@ -134,20 +137,18 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
     language_id: LanguageId,
     query_data: JByteArray<'local>,
 ) -> JObjectArray<'local> {
-    let Some(ts_language) = LANGUAGE_REGISTRY
-        .read()
-        .unwrap()
-        .language(language_id)
-        .map(|l| Arc::clone(&l.ts_language))
+    let Ok(ts_language) = with_language(language_id, |language| language.ts_language.clone())
     else {
         env.throw_new("java/lang/IllegalArgumentException", "invalid language id")
             .unwrap();
         return JObjectArray::default();
     };
+
     let query_size = env.get_array_length(&query_data).unwrap() as usize;
     let mut query_buffer = vec![0i8; query_size];
     env.get_byte_array_region(&query_data, 0, &mut query_buffer)
         .expect("array fits the buffer");
+
     // SAFETY: transmute from &[i8] to &[u8] is valid
     let query_slice = unsafe { transmute(query_buffer.as_slice()) };
     let Ok(query_str) = str::from_utf8(query_slice) else {
@@ -184,13 +185,11 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
     };
 
     let query = Arc::new((query, additional_predicates));
-    LANGUAGE_REGISTRY
-        .write()
-        .unwrap()
-        .language(language_id)
-        .expect("already checked that language exists")
-        .parser_info_mut()
-        .highlights_query = Some(Arc::clone(&query));
+    with_language(language_id, |language| {
+        language.parser_info_mut().highlights_query = Some(Arc::clone(&query));
+    })
+    .expect("already checked that language exists");
+
     let capture_names = query.0.capture_names();
     let capture_names_array = env
         .new_object_array(
