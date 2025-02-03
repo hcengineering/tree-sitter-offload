@@ -6,19 +6,17 @@ use std::{
 };
 
 use jni::{
+    errors::Result as JNIResult,
     objects::{JCharArray, JClass, JObject, JValue},
     sys::{jint, jsize},
     JNIEnv,
 };
 use streaming_iterator::StreamingIterator as _;
-use tree_sitter::{
-    ffi::{self, TSTree},
-    Node, Query, QueryCursor, TextProvider, Tree, TreeCursor,
-};
+use tree_sitter::{Node, Query, QueryCursor, TextProvider, Tree, TreeCursor};
 
 use crate::{
-    language_registry::{with_language, LanguageId},
-    predicates::AdditionalPredicates,
+    jni_utils::throw_exception_from_result, language_registry::with_language,
+    predicates::AdditionalPredicates, syntax_snapshot::SyntaxSnapshotDesc,
 };
 
 use super::HighlightToken;
@@ -257,82 +255,75 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeHighli
 >(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    language_id: LanguageId,
-    tree: JObject<'local>,
+    snapshot: JObject<'local>,
     text: JCharArray<'local>,
     start_offset: jint,
     end_offset: jint,
 ) -> JObject<'local> {
-    let tree_ptr = env
-        .call_method(&tree, "getPtr", "()J", &[])
-        .unwrap()
-        .j()
-        .unwrap();
-    let tree_ptr = tree_ptr as *mut TSTree;
-    let copied_tree = unsafe { ffi::ts_tree_copy(tree_ptr) };
-    let tree = unsafe { Tree::from_raw(copied_tree) };
-    let text_length = env.get_array_length(&text).unwrap();
-    let mut text_buffer = vec![0u16; text_length as usize];
-    env.get_char_array_region(&text, 0, &mut text_buffer)
-        .unwrap();
-    let Ok(query) = with_language(language_id, |language| {
-        language
-            .parser_info()
-            .highlights_query
-            .as_ref()
-            .map(Arc::clone)
-    }) else {
-        env.throw_new("java/lang/IllegalArgumentException", "invalid language id")
-            .unwrap();
-        return JObject::null();
-    };
-    let Some(query) = query else {
-        return JObject::null();
-    };
+    fn inner<'local>(
+        env: &mut JNIEnv<'local>,
+        snapshot: JObject<'local>,
+        text: JCharArray<'local>,
+        start_offset: jint,
+        end_offset: jint,
+    ) -> JNIResult<JObject<'local>> {
+        let (snapshot, base_language_id) = SyntaxSnapshotDesc::from_java_object(env, snapshot)?;
+        let text_length = env.get_array_length(&text)?;
+        let mut text_buffer = vec![0u16; text_length as usize];
+        env.get_char_array_region(&text, 0, &mut text_buffer)?;
+        let Ok(query) = with_language(base_language_id, |language| {
+            language
+                .parser_info()
+                .highlights_query
+                .as_ref()
+                .map(Arc::clone)
+        }) else {
+            env.throw_new("java/lang/IllegalArgumentException", "invalid language id")?;
+            return Ok(JObject::null());
+        };
+        let Some(query) = query else {
+            return Ok(JObject::null());
+        };
 
-    let (start_offset, tokens) = highlight_tokens_cover(
-        &tree,
-        &query,
-        &text_buffer,
-        (start_offset as usize)..(end_offset as usize),
-    );
-    let token_lengths = env.new_int_array(tokens.len() as i32).unwrap();
-    let token_node_kinds = env.new_short_array(tokens.len() as i32).unwrap();
-    let token_capture_ids = env.new_short_array(tokens.len() as i32).unwrap();
-    const CHUNK_SIZE: usize = 2048;
-    let mut token_lengths_buf: Vec<i32> = Vec::with_capacity(CHUNK_SIZE);
-    let mut token_node_kinds_buf: Vec<i16> = Vec::with_capacity(CHUNK_SIZE);
-    let mut token_capture_ids_buf: Vec<i16> = Vec::with_capacity(CHUNK_SIZE);
-    for (slice_idx, tokens_slice) in tokens.chunks(CHUNK_SIZE).enumerate() {
-        for token in tokens_slice {
-            token_lengths_buf.push(token.length as i32);
-            token_node_kinds_buf.push(token.kind_id as i16);
-            token_capture_ids_buf.push(token.capture_id as i16);
+        let (start_offset, tokens) = highlight_tokens_cover(
+            &snapshot.tree,
+            &query,
+            &text_buffer,
+            (start_offset as usize)..(end_offset as usize),
+        );
+        let token_lengths = env.new_int_array(tokens.len() as i32)?;
+        let token_node_kinds = env.new_short_array(tokens.len() as i32)?;
+        let token_capture_ids = env.new_short_array(tokens.len() as i32)?;
+        const CHUNK_SIZE: usize = 2048;
+        let mut token_lengths_buf: Vec<i32> = Vec::with_capacity(CHUNK_SIZE);
+        let mut token_node_kinds_buf: Vec<i16> = Vec::with_capacity(CHUNK_SIZE);
+        let mut token_capture_ids_buf: Vec<i16> = Vec::with_capacity(CHUNK_SIZE);
+        for (slice_idx, tokens_slice) in tokens.chunks(CHUNK_SIZE).enumerate() {
+            for token in tokens_slice {
+                token_lengths_buf.push(token.length as i32);
+                token_node_kinds_buf.push(token.kind_id as i16);
+                token_capture_ids_buf.push(token.capture_id as i16);
+            }
+            env.set_int_array_region(
+                &token_lengths,
+                (slice_idx * CHUNK_SIZE) as jsize,
+                &token_lengths_buf,
+            )?;
+            env.set_short_array_region(
+                &token_node_kinds,
+                (slice_idx * CHUNK_SIZE) as jsize,
+                &token_node_kinds_buf,
+            )?;
+            env.set_short_array_region(
+                &token_capture_ids,
+                (slice_idx * CHUNK_SIZE) as jsize,
+                &token_capture_ids_buf,
+            )?;
+            token_lengths_buf.clear();
+            token_node_kinds_buf.clear();
+            token_capture_ids_buf.clear();
         }
-        env.set_int_array_region(
-            &token_lengths,
-            (slice_idx * CHUNK_SIZE) as jsize,
-            &token_lengths_buf,
-        )
-        .unwrap();
-        env.set_short_array_region(
-            &token_node_kinds,
-            (slice_idx * CHUNK_SIZE) as jsize,
-            &token_node_kinds_buf,
-        )
-        .unwrap();
-        env.set_short_array_region(
-            &token_capture_ids,
-            (slice_idx * CHUNK_SIZE) as jsize,
-            &token_capture_ids_buf,
-        )
-        .unwrap();
-        token_lengths_buf.clear();
-        token_node_kinds_buf.clear();
-        token_capture_ids_buf.clear();
-    }
-    let tokens_obj = env
-        .new_object(
+        let tokens_obj = env.new_object(
             "com/hulylabs/treesitter/rusty/TreeSitterNativeHighlightLexer$Tokens",
             "(I[I[S[S)V",
             &[
@@ -341,8 +332,10 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeHighli
                 JValue::Object(token_node_kinds.deref()),
                 JValue::Object(token_capture_ids.deref()),
             ],
-        )
-        .unwrap();
+        )?;
 
-    tokens_obj
+        Ok(tokens_obj)
+    }
+    let result = inner(&mut env, snapshot, text, start_offset, end_offset);
+    throw_exception_from_result(&mut env, result)
 }

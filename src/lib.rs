@@ -3,8 +3,10 @@ use std::{ffi::c_void, sync::OnceLock};
 use jni::{sys::jint, JavaVM};
 
 mod highlighting_lexer;
+mod jni_utils;
 mod language_registry;
 mod predicates;
+mod syntax_snapshot;
 
 pub(crate) static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
 
