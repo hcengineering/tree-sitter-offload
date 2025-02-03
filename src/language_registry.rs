@@ -6,7 +6,6 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc, LazyLock, RwLock,
     },
-    usize,
 };
 
 use crossbeam_utils::sync::ShardedLock;
@@ -18,7 +17,11 @@ use jni::{
 };
 use tree_sitter::Query;
 
-use crate::predicates::{AdditionalPredicates, PREDICATE_PARSER};
+use crate::{
+    predicates::{AdditionalPredicates, PREDICATE_PARSER},
+    ranges::RangesQueryError,
+    RangesQuery,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -37,7 +40,7 @@ impl<O> From<LanguageId> for JValueGen<O> {
 }
 
 static LANGUAGE_ID_COUNTER: AtomicI64 = AtomicI64::new(0);
-static LANGUAGE_REGISTRY: LazyLock<RwLock<LanguageRegistry>> = LazyLock::new(|| RwLock::default());
+static LANGUAGE_REGISTRY: LazyLock<RwLock<LanguageRegistry>> = LazyLock::new(RwLock::default);
 
 impl LanguageId {
     fn new() -> LanguageId {
@@ -47,8 +50,8 @@ impl LanguageId {
 
 pub struct LanguageParserInfo {
     pub(crate) highlights_query: Option<Arc<(tree_sitter::Query, AdditionalPredicates)>>,
-    pub(crate) folds_query: Option<Arc<(tree_sitter::Query, AdditionalPredicates)>>,
-    pub(crate) indents_query: Option<Arc<(tree_sitter::Query, AdditionalPredicates)>>,
+    pub(crate) folds_query: Option<Arc<RangesQuery>>,
+    pub(crate) indents_query: Option<Arc<RangesQuery>>,
     pub(crate) injections_query: Option<Arc<(tree_sitter::Query, AdditionalPredicates)>>,
 }
 
@@ -152,6 +155,17 @@ pub fn with_language<T>(
     Ok(f(language))
 }
 
+pub fn with_language_by_name<T>(
+    language_name: impl AsRef<str>,
+    f: impl FnOnce(&Language) -> T,
+) -> Result<T, LanguageError> {
+    let registry = LANGUAGE_REGISTRY.read().unwrap();
+    let language = registry
+        .language_by_name(language_name.as_ref())
+        .ok_or(LanguageError::InvalidLanguageId)?;
+    Ok(f(language))
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum QueryParseError {
     #[error(transparent)]
@@ -173,7 +187,7 @@ fn parse_query<'local>(
     let mut query_buffer = vec![0i8; query_size];
     env.get_byte_array_region(&query_data, 0, &mut query_buffer)?;
     // SAFETY: transmute from &[i8] to &[u8] is valid
-    let query_slice = unsafe { transmute(query_buffer.as_slice()) };
+    let query_slice = unsafe { transmute::<&[i8], &[u8]>(query_buffer.as_slice()) };
     let query_str = str::from_utf8(query_slice)?;
     let query = Query::new(language, query_str)?;
     let additional_predicates =
@@ -207,12 +221,10 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
             "java/lang/String",
             JString::default(),
         )?;
-        let mut index = 0i32;
-        for capture_name in capture_names {
+        for (index, capture_name) in capture_names.iter().enumerate() {
             let capture_name = env.new_string(capture_name)?;
-            env.set_object_array_element(&capture_names_array, index, &capture_name)?;
+            env.set_object_array_element(&capture_names_array, index as i32, &capture_name)?;
             env.delete_local_ref(capture_name)?;
-            index += 1;
         }
         Ok(capture_names_array)
     }
@@ -231,6 +243,14 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+enum AddRangesQueryError {
+    #[error(transparent)]
+    ParseError(#[from] QueryParseError),
+    #[error(transparent)]
+    RangesError(#[from] RangesQueryError),
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLanguageRegistry_nativeAddFoldQuery<
     'local,
@@ -244,19 +264,24 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
         env: &mut JNIEnv<'local>,
         language_id: LanguageId,
         query_data: JByteArray<'local>,
-    ) -> Result<(), QueryParseError> {
-        let ts_language = with_language(language_id, |language| language.ts_language.clone())?;
-        let query = parse_query(env, &ts_language, query_data)?;
+    ) -> Result<(), AddRangesQueryError> {
+        let ts_language = with_language(language_id, |language| language.ts_language.clone())
+            .map_err(QueryParseError::from)?;
+        let (query, predicates) = parse_query(env, &ts_language, query_data)?;
+        let query = RangesQuery::new(query, predicates, "fold")?;
         let query = Arc::new(query);
         with_language(language_id, |language| {
-            language.parser_info_mut().folds_query = Some(Arc::clone(&query));
-        })?;
+            language.parser_info_mut().folds_query = Some(query);
+        })
+        .map_err(QueryParseError::from)?;
         Ok(())
     }
     let result = inner(&mut env, language_id, query_data);
     match result {
         Ok(()) => (),
-        Err(QueryParseError::JNIError(JNIError::JavaException)) => (),
+        Err(AddRangesQueryError::ParseError(QueryParseError::JNIError(
+            JNIError::JavaException,
+        ))) => (),
         Err(err) => {
             env.throw_new(
                 "java/lang/RuntimeException",
@@ -280,19 +305,24 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeLangua
         env: &mut JNIEnv<'local>,
         language_id: LanguageId,
         query_data: JByteArray<'local>,
-    ) -> Result<(), QueryParseError> {
-        let ts_language = with_language(language_id, |language| language.ts_language.clone())?;
-        let query = parse_query(env, &ts_language, query_data)?;
+    ) -> Result<(), AddRangesQueryError> {
+        let ts_language = with_language(language_id, |language| language.ts_language.clone())
+            .map_err(QueryParseError::from)?;
+        let (query, predicates) = parse_query(env, &ts_language, query_data)?;
+        let query = RangesQuery::new(query, predicates, "indent")?;
         let query = Arc::new(query);
         with_language(language_id, |language| {
-            language.parser_info_mut().indents_query = Some(Arc::clone(&query));
-        })?;
+            language.parser_info_mut().indents_query = Some(query);
+        })
+        .map_err(QueryParseError::from)?;
         Ok(())
     }
     let result = inner(&mut env, language_id, query_data);
     match result {
         Ok(()) => (),
-        Err(QueryParseError::JNIError(JNIError::JavaException)) => (),
+        Err(AddRangesQueryError::ParseError(QueryParseError::JNIError(
+            JNIError::JavaException,
+        ))) => (),
         Err(err) => {
             env.throw_new(
                 "java/lang/RuntimeException",

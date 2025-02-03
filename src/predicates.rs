@@ -25,8 +25,8 @@ struct TextProviderPredicateImpl<'a, T: TextProvider<I>, I: AsRef<[u8]>> {
     _phantom: PhantomData<I>,
 }
 
-impl<'a, T: TextProvider<I>, I: AsRef<[u8]>> TextProviderPredicate
-    for TextProviderPredicateImpl<'a, T, I>
+impl<T: TextProvider<I>, I: AsRef<[u8]>> TextProviderPredicate
+    for TextProviderPredicateImpl<'_, T, I>
 {
     fn text(&mut self, node: Node) -> &[u8] {
         let chunks = self.text_provider.text(node);
@@ -39,9 +39,9 @@ impl<'a, T: TextProvider<I>, I: AsRef<[u8]>> TextProviderPredicate
 }
 
 pub trait Predicate {
-    fn check_predicate<'cursor, 'tree>(
+    fn check_predicate(
         &self,
-        mat: &QueryMatch<'cursor, 'tree>,
+        mat: &QueryMatch<'_, '_>,
         text: &mut dyn TextProviderPredicate,
     ) -> bool;
 }
@@ -58,8 +58,7 @@ pub trait PredicateParser {
 
 impl PredicateParser for HashMap<&'static str, Box<dyn PredicateParser>> {
     fn can_parse_predicate(&self, name: &str) -> bool {
-        self.get(&name)
-            .map_or(false, |p| p.can_parse_predicate(name))
+        self.get(&name).is_some_and(|p| p.can_parse_predicate(name))
     }
 
     fn parse_predicate(
@@ -162,9 +161,9 @@ impl PredicateParser for ContainsPredicateParser {
 }
 
 impl Predicate for ContainsPredicate {
-    fn check_predicate<'cursor, 'tree>(
+    fn check_predicate(
         &self,
-        mat: &QueryMatch<'cursor, 'tree>,
+        mat: &QueryMatch<'_, '_>,
         texts: &mut dyn TextProviderPredicate,
     ) -> bool {
         for node in mat.nodes_for_capture_index(self.capture_id) {
@@ -182,8 +181,10 @@ impl Predicate for ContainsPredicate {
     }
 }
 
+type AnyPredicate = Box<dyn Predicate + Send + Sync>;
+
 pub struct AdditionalPredicates {
-    predicates: Box<[Box<[Box<dyn Predicate + Send + Sync>]>]>,
+    predicates: Box<[Box<[AnyPredicate]>]>,
 }
 
 impl AdditionalPredicates {
@@ -197,7 +198,7 @@ impl AdditionalPredicates {
             let pattern_start = query.start_byte_for_pattern(pattern_idx);
             let row = source
                 .char_indices()
-                .take_while(|(i, _)| *i < pattern_start as usize)
+                .take_while(|(i, _)| *i < pattern_start)
                 .filter(|(_, c)| *c == '\n')
                 .count();
             let general_predicates = query.general_predicates(pattern_idx);
@@ -206,7 +207,7 @@ impl AdditionalPredicates {
                 if !parser.can_parse_predicate(predicate.operator.deref()) {
                     continue;
                 }
-                parsed_predicates.push(parser.parse_predicate(&query, row, predicate)?);
+                parsed_predicates.push(parser.parse_predicate(query, row, predicate)?);
             }
             additional_predicates.push(parsed_predicates.into());
         }

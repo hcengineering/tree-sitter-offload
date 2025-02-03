@@ -7,7 +7,10 @@ use jni::{
     JNIEnv,
 };
 
-use crate::{jni_utils::throw_exception_from_result, language_registry::LanguageId};
+use crate::{
+    jni_utils::{throw_exception_from_result, PointDesc, RangeDesc},
+    language_registry::LanguageId,
+};
 
 use super::SyntaxSnapshot;
 
@@ -73,7 +76,7 @@ impl<'local> SyntaxSnapshotDesc<'local> {
         }
     }
 
-    fn from_java_object_impl(
+    fn ref_from_java_object_impl(
         &self,
         env: &mut JNIEnv<'local>,
         snapshot: JObject<'local>,
@@ -101,7 +104,7 @@ impl<'local> SyntaxSnapshotDesc<'local> {
         env: &mut JNIEnv<'local>,
         snapshot: JObject<'local>,
     ) -> JNIResult<(&'local SyntaxSnapshot, LanguageId)> {
-        SyntaxSnapshotDesc::from_obj_class(env, &snapshot)?.from_java_object_impl(env, snapshot)
+        SyntaxSnapshotDesc::from_obj_class(env, &snapshot)?.ref_from_java_object_impl(env, snapshot)
     }
 }
 
@@ -148,7 +151,7 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
         old_snapshot: JObject<'local>,
     ) -> JNIResult<JObject<'local>> {
         let desc = SyntaxSnapshotDesc::from_class(env, class)?;
-        let (old_snapshot, base_language_id) = desc.from_java_object_impl(env, old_snapshot)?;
+        let (old_snapshot, base_language_id) = desc.ref_from_java_object_impl(env, old_snapshot)?;
         let text_length = env.get_array_length(&text)? as usize;
         let mut text_buffer = vec![0u16; text_length];
         env.get_char_array_region(&text, 0, &mut text_buffer)?;
@@ -193,7 +196,7 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
         edit: JObject<'local>,
     ) -> JNIResult<JObject<'local>> {
         let desc = SyntaxSnapshotDesc::from_class(env, class)?;
-        let (snapshot, base_language_id) = desc.from_java_object_impl(env, snapshot)?;
+        let (snapshot, base_language_id) = desc.ref_from_java_object_impl(env, snapshot)?;
         let edit = InputEditMethods::from_java_object(env, &edit)?;
 
         let snapshot = snapshot.with_edit(&edit);
@@ -202,55 +205,6 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
     }
     let result = inner(&mut env, class, snapshot, edit);
     throw_exception_from_result(&mut env, result)
-}
-
-static RANGE_CONSTRUCTOR: JOnceLock<JMethodID> = JOnceLock::new();
-
-struct RangeDesc<'local> {
-    constructor: JMethodID,
-    class: AutoLocal<'local, JClass<'local>>,
-}
-
-impl<'local> RangeDesc<'local> {
-    fn new(env: &mut JNIEnv<'local>) -> JNIResult<RangeDesc<'local>> {
-        let class = env.find_class("com/hulylabs/treesitter/language/Range")?;
-        let constructor = *RANGE_CONSTRUCTOR.get_or_try_init(|| {
-            env.get_method_id(
-                &class,
-                "<init>",
-                "(IILcom/hulylabs/treesitter/language/Point;Lcom/hulylabs/treesitter/language/Point;)V",
-            )
-        })?;
-        Ok(RangeDesc {
-            constructor,
-            class: env.auto_local(class),
-        })
-    }
-
-    fn to_java_object(
-        &self,
-        point_desc: &PointDesc<'local>,
-        env: &mut JNIEnv<'local>,
-        range: tree_sitter::Range,
-    ) -> JNIResult<JObject<'local>> {
-        let start_point = point_desc.to_java_object(env, &range.start_point)?;
-        let start_point = env.auto_local(start_point);
-        let end_point = point_desc.to_java_object(env, &range.end_point)?;
-        let end_point = env.auto_local(end_point);
-        // SAFETY: constructor is valid and derived from class by construction of self
-        unsafe {
-            env.new_object_unchecked(
-                &self.class,
-                self.constructor,
-                &[
-                    JValue::Int((range.start_byte / 2) as i32).as_jni(),
-                    JValue::Int((range.end_byte / 2) as i32).as_jni(),
-                    JValue::Object(&start_point).as_jni(),
-                    JValue::Object(&end_point).as_jni(),
-                ],
-            )
-        }
-    }
 }
 
 #[no_mangle]
@@ -269,24 +223,21 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
         new_snapshot: JObject<'local>,
     ) -> JNIResult<JObjectArray<'local>> {
         let desc = SyntaxSnapshotDesc::from_class(env, class)?;
-        let (old_snapshot, _) = desc.from_java_object_impl(env, old_snapshot)?;
-        let (new_snapshot, _) = desc.from_java_object_impl(env, new_snapshot)?;
+        let (old_snapshot, _) = desc.ref_from_java_object_impl(env, old_snapshot)?;
+        let (new_snapshot, _) = desc.ref_from_java_object_impl(env, new_snapshot)?;
 
-        let changed_ranges = old_snapshot.changed_ranges(&new_snapshot);
+        let changed_ranges = old_snapshot.changed_ranges(new_snapshot);
 
         let length = changed_ranges.len();
         let range_desc = RangeDesc::new(env)?;
-        let point_desc = PointDesc::new(env)?;
         let array = env.new_object_array(length as i32, &range_desc.class, JObject::null())?;
-        let mut i = 0;
-        for range in changed_ranges {
+        for (i, range) in changed_ranges.enumerate() {
             if i > length {
                 break;
             }
-            let range_obj = range_desc.to_java_object(&point_desc, env, range)?;
+            let range_obj = range_desc.to_java_object(env, range)?;
             let range_obj = env.auto_local(range_obj);
             env.set_object_array_element(&array, i as i32, &range_obj)?;
-            i += 1;
         }
         Ok(array)
     }
@@ -333,7 +284,7 @@ impl InputEditMethods {
     ) -> JNIResult<usize> {
         // SAFETY: method_id is valid and derived from class by construction of self
         Ok((unsafe {
-            env.call_method_unchecked(&obj, method_id, ReturnType::Primitive(Primitive::Int), &[])
+            env.call_method_unchecked(obj, method_id, ReturnType::Primitive(Primitive::Int), &[])
         })?
         .i()? as usize
             * 2)
@@ -347,7 +298,7 @@ impl InputEditMethods {
     ) -> JNIResult<tree_sitter::Point> {
         // SAFETY: method_id is valid and derived from class by construction of self
         let point_obj = unsafe {
-            env.call_method_unchecked(&obj, method_id, ReturnType::Object, &[])?
+            env.call_method_unchecked(obj, method_id, ReturnType::Object, &[])?
                 .l()?
         };
         PointDesc::from_java_object(env, &point_obj)
@@ -358,12 +309,12 @@ impl InputEditMethods {
         edit: &JObject<'local>,
     ) -> JNIResult<tree_sitter::InputEdit> {
         let desc = InputEditMethods::from_obj_class(env, edit)?;
-        let start_byte = desc.call_offset_method(env, &edit, desc.start_offset)?;
-        let old_end_byte = desc.call_offset_method(env, &edit, desc.old_end_offset)?;
-        let new_end_byte = desc.call_offset_method(env, &edit, desc.new_end_offset)?;
-        let start_position = desc.call_point_method(env, &edit, desc.start_point)?;
-        let old_end_position = desc.call_point_method(env, &edit, desc.old_end_point)?;
-        let new_end_position = desc.call_point_method(env, &edit, desc.new_end_point)?;
+        let start_byte = desc.call_offset_method(env, edit, desc.start_offset)?;
+        let old_end_byte = desc.call_offset_method(env, edit, desc.old_end_offset)?;
+        let new_end_byte = desc.call_offset_method(env, edit, desc.new_end_offset)?;
+        let start_position = desc.call_point_method(env, edit, desc.start_point)?;
+        let old_end_position = desc.call_point_method(env, edit, desc.old_end_point)?;
+        let new_end_position = desc.call_point_method(env, edit, desc.new_end_point)?;
         Ok(tree_sitter::InputEdit {
             start_byte,
             old_end_byte,
@@ -371,96 +322,6 @@ impl InputEditMethods {
             start_position,
             old_end_position,
             new_end_position,
-        })
-    }
-}
-
-static POINT_METHODS: JOnceLock<PointMethods> = JOnceLock::new();
-
-struct PointMethods {
-    constructor: JMethodID,
-    row: JMethodID,
-    column: JMethodID,
-}
-
-struct PointDesc<'local> {
-    methods: &'static PointMethods,
-    class: AutoLocal<'local, JClass<'local>>,
-}
-
-impl<'local> PointDesc<'local> {
-    fn new(env: &mut JNIEnv<'local>) -> JNIResult<PointDesc<'local>> {
-        let class = env.find_class("com/hulylabs/treesitter/language/Point")?;
-        PointDesc::from_class(env, class)
-    }
-
-    fn from_class(env: &mut JNIEnv<'local>, class: JClass<'local>) -> JNIResult<PointDesc<'local>> {
-        let methods = POINT_METHODS.get_or_try_init(|| {
-            Ok::<_, JNIError>(PointMethods {
-                constructor: env.get_method_id(&class, "<init>", "(II)V")?,
-                row: env.get_method_id(&class, "getRow", "()I")?,
-                column: env.get_method_id(&class, "getColumn", "()I")?,
-            })
-        })?;
-        Ok(PointDesc {
-            methods,
-            class: env.auto_local(class),
-        })
-    }
-
-    fn from_obj_class(
-        env: &mut JNIEnv<'local>,
-        obj: &JObject<'local>,
-    ) -> JNIResult<PointDesc<'local>> {
-        let class = env.get_object_class(obj)?;
-        Self::from_class(env, class)
-    }
-
-    fn to_java_object(
-        &self,
-        env: &mut JNIEnv<'local>,
-        point: &tree_sitter::Point,
-    ) -> JNIResult<JObject<'local>> {
-        // SAFETY: constructor is valid and derived from class by construction of self
-        unsafe {
-            env.new_object_unchecked(
-                &self.class,
-                self.methods.constructor,
-                &[
-                    JValue::Int(point.row as i32).as_jni(),
-                    JValue::Int(point.column as i32 / 2).as_jni(),
-                ],
-            )
-        }
-    }
-
-    fn from_java_object(
-        env: &mut JNIEnv<'local>,
-        point: &JObject<'local>,
-    ) -> JNIResult<tree_sitter::Point> {
-        let desc = Self::from_obj_class(env, point)?;
-        Ok(tree_sitter::Point {
-            // SAFETY: method_id is valid and derived from class by construction of desc
-            row: unsafe {
-                env.call_method_unchecked(
-                    &point,
-                    desc.methods.row,
-                    ReturnType::Primitive(Primitive::Int),
-                    &[],
-                )
-            }?
-            .i()? as usize,
-            // SAFETY: method_id is valid and derived from class by construction of desc
-            column: (unsafe {
-                env.call_method_unchecked(
-                    &point,
-                    desc.methods.column,
-                    ReturnType::Primitive(Primitive::Int),
-                    &[],
-                )
-            }?
-            .i()? as usize)
-                * 2,
         })
     }
 }

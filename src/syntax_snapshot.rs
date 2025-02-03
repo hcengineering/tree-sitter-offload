@@ -10,7 +10,7 @@ struct ParsersPool {
     pool: Arc<Mutex<Vec<tree_sitter::Parser>>>,
 }
 
-static PARSERS_POOL: LazyLock<ParsersPool> = LazyLock::new(|| ParsersPool::default());
+static PARSERS_POOL: LazyLock<ParsersPool> = LazyLock::new(ParsersPool::default);
 
 impl ParsersPool {
     fn with_parser<T, F: FnOnce(&mut tree_sitter::Parser) -> T>(&self, func: F) -> T {
@@ -40,7 +40,7 @@ impl SyntaxSnapshot {
             with_language(base_language_id, |language| language.ts_language()).ok()?;
         let tree = with_parser(|parser| {
             parser.set_language(&ts_language).ok()?;
-            parser.parse_utf16(&text, None)
+            parser.parse_utf16(text, None)
         });
         tree.map(|tree| Self { tree })
     }
@@ -54,7 +54,7 @@ impl SyntaxSnapshot {
             with_language(base_language_id, |language| language.ts_language()).ok()?;
         let tree = with_parser(|parser| {
             parser.set_language(&ts_language).ok()?;
-            parser.parse_utf16(&text, Some(&old_snapshot.tree))
+            parser.parse_utf16(text, Some(&old_snapshot.tree))
         });
         tree.map(|tree| Self { tree })
     }

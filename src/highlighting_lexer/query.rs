@@ -1,5 +1,4 @@
 use std::{
-    char,
     collections::HashMap,
     ops::{Deref, Range},
     sync::Arc,
@@ -12,73 +11,22 @@ use jni::{
     JNIEnv,
 };
 use streaming_iterator::StreamingIterator as _;
-use tree_sitter::{Node, Query, QueryCursor, TextProvider, Tree, TreeCursor};
+use tree_sitter::{Node, Query, QueryCursor, Tree, TreeCursor};
 
 use crate::{
     jni_utils::throw_exception_from_result, language_registry::with_language,
-    predicates::AdditionalPredicates, syntax_snapshot::SyntaxSnapshotDesc,
+    predicates::AdditionalPredicates, query::RecodingUtf16TextProvider,
+    syntax_snapshot::SyntaxSnapshotDesc,
 };
 
 use super::HighlightToken;
 
-struct RecodingUtf16TextProvider<'a> {
-    text: &'a [u16],
-}
-
-struct RecodingUtf16TextProviderIterator<'a> {
-    text: &'a [u16],
-    start_offset: usize,
-    end_offset: usize,
-    ended: bool,
-}
-
-impl<'a> Iterator for RecodingUtf16TextProviderIterator<'a> {
-    type Item = Vec<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ended {
-            return None;
-        }
-        // Expect mostly ascii
-        let mut buf = Vec::with_capacity(self.end_offset - self.start_offset);
-        let mut char_buf = [0u8; 4];
-        for c in char::decode_utf16(
-            self.text[self.start_offset..self.end_offset]
-                .iter()
-                .copied(),
-        ) {
-            let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
-            let c_len = c.len_utf8();
-            c.encode_utf8(&mut char_buf);
-            buf.extend_from_slice(&char_buf[0..c_len]);
-        }
-        self.ended = true;
-        Some(buf)
-    }
-}
-
-impl<'a> TextProvider<Vec<u8>> for RecodingUtf16TextProvider<'a> {
-    type I = RecodingUtf16TextProviderIterator<'a>;
-
-    fn text(&mut self, node: Node) -> Self::I {
-        let start_offset = node.start_byte() / 2;
-        let end_offset = node.end_byte() / 2;
-
-        RecodingUtf16TextProviderIterator {
-            text: self.text,
-            start_offset,
-            end_offset,
-            ended: false,
-        }
-    }
-}
-
 // Find start byte of minimal token cover of range
 // Returns (cover_start_byte, parent_stack, tree_cursor)
-fn find_cover_start<'tree>(
-    tree: &'tree Tree,
+fn find_cover_start(
+    tree: &Tree,
     byte_start: usize,
-) -> (usize, Vec<(usize, Range<usize>)>, TreeCursor<'tree>) {
+) -> (usize, Vec<(usize, Range<usize>)>, TreeCursor) {
     let root = tree.root_node();
     let mut tree_cursor = root.walk();
     let mut parent_stack = Vec::new();
@@ -125,8 +73,8 @@ fn collect_highlights_for_range(
 ) -> HashMap<Range<usize>, (u16, usize)> {
     let mut query_cursor = QueryCursor::new();
     query_cursor.set_byte_range(byte_range);
-    let text_provider = RecodingUtf16TextProvider { text };
-    let mut text_provider2 = RecodingUtf16TextProvider { text };
+    let text_provider = RecodingUtf16TextProvider::new(text);
+    let mut text_provider2 = RecodingUtf16TextProvider::new(text);
     let mut captures = query_cursor.captures(&query.0, tree.root_node(), text_provider);
     let mut highlights: HashMap<Range<usize>, (u16, usize)> = HashMap::new();
     while let Some((next_match, cidx)) = captures.next() {
@@ -156,7 +104,7 @@ pub fn highlight_tokens_cover(
     text: &[u16],
     range: Range<usize>,
 ) -> (usize, Vec<HighlightToken>) {
-    let (byte_start, parent_stack, mut tree_cursor) = find_cover_start(&tree, range.start * 2);
+    let (byte_start, parent_stack, mut tree_cursor) = find_cover_start(tree, range.start * 2);
     let byte_end = range.end * 2;
 
     let highlights = collect_highlights_for_range(tree, query, text, byte_start..byte_end);
