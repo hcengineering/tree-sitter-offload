@@ -162,28 +162,30 @@ impl InjectionQuery {
                 }
             }
             for predicate in result.query.general_predicates(pattern_idx) {
-                if predicate.operator.deref() == "offset!" { match predicate.args.deref() {
-                    [ts::QueryPredicateArg::Capture(capture_id), ts::QueryPredicateArg::String(arg1), ts::QueryPredicateArg::String(arg2)] =>
-                    {
-                        let (Ok(arg1), Ok(arg2)) =
-                            (str::parse::<i32>(arg1), str::parse::<i32>(arg2))
-                        else {
+                if predicate.operator.deref() == "offset!" {
+                    match predicate.args.deref() {
+                        [ts::QueryPredicateArg::Capture(capture_id), ts::QueryPredicateArg::String(arg1), ts::QueryPredicateArg::String(arg2)] =>
+                        {
+                            let (Ok(arg1), Ok(arg2)) =
+                                (str::parse::<i32>(arg1), str::parse::<i32>(arg2))
+                            else {
+                                return Err(InjectionQueryError::InvalidPredicate(
+                                    pattern_idx,
+                                    predicate.operator.clone(),
+                                ));
+                            };
+                            injection_info
+                                .offsets
+                                .insert(*capture_id, CaptureOffset::new(arg1 * 2, arg2 * 2));
+                        }
+                        _ => {
                             return Err(InjectionQueryError::InvalidPredicate(
                                 pattern_idx,
                                 predicate.operator.clone(),
                             ));
-                        };
-                        injection_info
-                            .offsets
-                            .insert(*capture_id, CaptureOffset::new(arg1 * 2, arg2 * 2));
+                        }
                     }
-                    _ => {
-                        return Err(InjectionQueryError::InvalidPredicate(
-                            pattern_idx,
-                            predicate.operator.clone(),
-                        ));
-                    }
-                } }
+                }
             }
             result.injections.push(injection_info);
         }
@@ -199,6 +201,7 @@ impl InjectionQuery {
         let mut query_cursor = ts::QueryCursor::new();
         let text_provider = RecodingUtf16TextProvider::new(text);
         let mut injections: Vec<InjectionMatch> = Vec::new();
+        let mut injection_ranges: HashMap<Range<usize>, usize> = HashMap::new();
         for change_byte_range in changed_byte_ranges {
             query_cursor.set_byte_range(
                 change_byte_range.start.saturating_sub(2)..(change_byte_range.end + 2),
@@ -250,14 +253,27 @@ impl InjectionQuery {
                 };
                 let range_start = query_ranges.first().expect("ranges are not empty");
                 let range_end = query_ranges.last().expect("ranges are not empty");
-                injections.push(InjectionMatch {
-                    id: query_match.pattern_index,
-                    language,
-                    enclosing_byte_range: range_start.start_byte..range_end.end_byte,
-                    included_ranges: query_ranges,
-                    combined: info.combined,
-                    include_children: info.include_children,
-                });
+                let enclosing_byte_range = range_start.start_byte..range_end.end_byte;
+                if let Some(injection_idx) = injection_ranges.get(&enclosing_byte_range) {
+                    injections[*injection_idx] = InjectionMatch {
+                        id: query_match.pattern_index,
+                        language,
+                        enclosing_byte_range,
+                        included_ranges: query_ranges,
+                        combined: info.combined,
+                        include_children: info.include_children,
+                    };
+                } else {
+                    injection_ranges.insert(enclosing_byte_range.clone(), injections.len());
+                    injections.push(InjectionMatch {
+                        id: query_match.pattern_index,
+                        language,
+                        enclosing_byte_range,
+                        included_ranges: query_ranges,
+                        combined: info.combined,
+                        include_children: info.include_children,
+                    });
+                }
             }
         }
         injections
