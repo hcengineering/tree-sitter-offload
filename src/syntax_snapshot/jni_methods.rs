@@ -2,7 +2,7 @@ use once_cell::sync::OnceCell as JOnceLock;
 
 use jni::{
     errors::{Error as JNIError, Result as JNIResult},
-    objects::{AutoLocal, JCharArray, JClass, JFieldID, JMethodID, JObject, JObjectArray, JValue},
+    objects::{AutoLocal, JCharArray, JClass, JFieldID, JMethodID, JObject, JValue},
     signature::{Primitive, ReturnType},
     JNIEnv,
 };
@@ -16,7 +16,6 @@ use super::SyntaxSnapshot;
 
 struct SyntaxSnapshotDescInner {
     constructor: JMethodID,
-    base_language_id_field: JFieldID,
     handle_field: JFieldID,
 }
 
@@ -35,11 +34,9 @@ impl<'local> SyntaxSnapshotDesc<'local> {
         Ok(SyntaxSnapshotDesc {
             inner: SYNTAX_SNAPSHOT.get_or_try_init(|| {
                 let constructor = env.get_method_id(&class, "<init>", "(JJ)V")?;
-                let base_language_id_field = env.get_field_id(&class, "baseLanguageId", "J")?;
                 let handle_field = env.get_field_id(&class, "handle", "J")?;
                 Ok::<_, JNIError>(SyntaxSnapshotDescInner {
                     constructor,
-                    base_language_id_field,
                     handle_field,
                 })
             })?,
@@ -80,30 +77,24 @@ impl<'local> SyntaxSnapshotDesc<'local> {
         &self,
         env: &mut JNIEnv<'local>,
         snapshot: JObject<'local>,
-    ) -> JNIResult<(&'local SyntaxSnapshot, LanguageId)> {
-        let base_language_id = env.get_field_unchecked(
-            &snapshot,
-            self.inner.base_language_id_field,
-            ReturnType::Primitive(Primitive::Long),
-        )?;
+    ) -> JNIResult<&'local SyntaxSnapshot> {
         let handle = env.get_field_unchecked(
             &snapshot,
             self.inner.handle_field,
             ReturnType::Primitive(Primitive::Long),
         )?;
-        let base_language_id: LanguageId = base_language_id.j()?.into();
         let handle = handle.j()? as *mut SyntaxSnapshot;
         // SAFETY: handle is expected to be created from Box raw ptr; handle is not freed for
         // lifetime of snapshot (duration of JNI call)
         let handle = unsafe { handle.as_ref() }
             .ok_or(JNIError::NullPtr("Snapshot handle expected to be non-null"))?;
-        Ok((handle, base_language_id))
+        Ok(handle)
     }
 
     pub fn from_java_object(
         env: &mut JNIEnv<'local>,
         snapshot: JObject<'local>,
-    ) -> JNIResult<(&'local SyntaxSnapshot, LanguageId)> {
+    ) -> JNIResult<&'local SyntaxSnapshot> {
         SyntaxSnapshotDesc::from_obj_class(env, &snapshot)?.ref_from_java_object_impl(env, snapshot)
     }
 }
@@ -135,6 +126,51 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
     throw_exception_from_result(&mut env, result)
 }
 
+static PAIR_METHODS: JOnceLock<PairMethods> = JOnceLock::new();
+struct PairMethods {
+    constructor: JMethodID,
+}
+
+struct PairDesc<'local> {
+    methods: &'static PairMethods,
+    class: AutoLocal<'local, JClass<'local>>,
+}
+
+impl<'local> PairDesc<'local> {
+    fn new(env: &mut JNIEnv<'local>) -> JNIResult<PairDesc<'local>> {
+        let class = env.find_class("kotlin/Pair")?;
+        let class = env.auto_local(class);
+        let methods = PAIR_METHODS.get_or_try_init(|| {
+            Ok::<_, JNIError>(PairMethods {
+                constructor: env.get_method_id(
+                    &class,
+                    "<init>",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                )?,
+            })
+        })?;
+        Ok(PairDesc { methods, class })
+    }
+
+    fn to_java_object(
+        &self,
+        env: &mut JNIEnv<'local>,
+        pair: (JObject<'local>, JObject<'local>),
+    ) -> JNIResult<JObject<'local>> {
+        // SAFETY: constructor is valid and derived from class by construction of self
+        unsafe {
+            env.new_object_unchecked(
+                &self.class,
+                self.methods.constructor,
+                &[
+                    JValue::Object(&pair.0).as_jni(),
+                    JValue::Object(&pair.1).as_jni(),
+                ],
+            )
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntaxSnapshot_nativeParseWithOld<
     'local,
@@ -143,26 +179,42 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
     class: JClass<'local>,
     text: JCharArray<'local>,
     old_snapshot: JObject<'local>,
+    edit: JObject<'local>,
 ) -> JObject<'local> {
     fn inner<'local>(
         env: &mut JNIEnv<'local>,
         class: JClass<'local>,
         text: JCharArray<'local>,
         old_snapshot: JObject<'local>,
+        edit: JObject<'local>,
     ) -> JNIResult<JObject<'local>> {
         let desc = SyntaxSnapshotDesc::from_class(env, class)?;
-        let (old_snapshot, base_language_id) = desc.ref_from_java_object_impl(env, old_snapshot)?;
+        let old_snapshot = desc.ref_from_java_object_impl(env, old_snapshot)?;
         let text_length = env.get_array_length(&text)? as usize;
         let mut text_buffer = vec![0u16; text_length];
         env.get_char_array_region(&text, 0, &mut text_buffer)?;
-        let Some(snapshot) =
-            SyntaxSnapshot::parse_incremental(base_language_id, &text_buffer, old_snapshot)
+        let edit = InputEditMethods::from_java_object(env, &edit)?;
+        let Some((snapshot, changed_ranges)) =
+            SyntaxSnapshot::parse_incremental(&text_buffer, old_snapshot, edit)
         else {
             return Ok(JObject::null());
         };
-        desc.to_java_object(env, base_language_id, snapshot)
+        let range_desc = RangeDesc::new(env)?;
+        let array = env.new_object_array(
+            changed_ranges.len() as i32,
+            &range_desc.class,
+            JObject::null(),
+        )?;
+        for (idx, range) in changed_ranges.into_iter().enumerate() {
+            let range_obj = range_desc.to_java_object(env, range)?;
+            let range_obj = env.auto_local(range_obj);
+            env.set_object_array_element(&array, idx as i32, &range_obj)?;
+        }
+        let pair_desc = PairDesc::new(env)?;
+        let snapshot = desc.to_java_object(env, snapshot.base_language(), snapshot)?;
+        pair_desc.to_java_object(env, (snapshot, array.into()))
     }
-    let result = inner(&mut env, class, text, old_snapshot);
+    let result = inner(&mut env, class, text, old_snapshot, edit);
     throw_exception_from_result(&mut env, result)
 }
 
@@ -178,71 +230,6 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
     // SAFETY: handle is created from Box::into_raw, called by java GC when no other reference to
     // it exists
     std::mem::drop(unsafe { Box::from_raw(ptr) });
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntaxSnapshot_nativeEdit<
-    'local,
->(
-    mut env: JNIEnv<'local>,
-    class: JClass<'local>,
-    snapshot: JObject<'local>,
-    edit: JObject<'local>,
-) -> JObject<'local> {
-    fn inner<'local>(
-        env: &mut JNIEnv<'local>,
-        class: JClass<'local>,
-        snapshot: JObject<'local>,
-        edit: JObject<'local>,
-    ) -> JNIResult<JObject<'local>> {
-        let desc = SyntaxSnapshotDesc::from_class(env, class)?;
-        let (snapshot, base_language_id) = desc.ref_from_java_object_impl(env, snapshot)?;
-        let edit = InputEditMethods::from_java_object(env, &edit)?;
-
-        let snapshot = snapshot.with_edit(&edit);
-
-        desc.to_java_object(env, base_language_id, snapshot)
-    }
-    let result = inner(&mut env, class, snapshot, edit);
-    throw_exception_from_result(&mut env, result)
-}
-
-#[no_mangle]
-pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntaxSnapshot_nativeGetChangedRanges<
-    'local,
->(
-    mut env: JNIEnv<'local>,
-    class: JClass<'local>,
-    old_snapshot: JObject<'local>,
-    new_snapshot: JObject<'local>,
-) -> JObjectArray<'local> {
-    fn inner<'local>(
-        env: &mut JNIEnv<'local>,
-        class: JClass<'local>,
-        old_snapshot: JObject<'local>,
-        new_snapshot: JObject<'local>,
-    ) -> JNIResult<JObjectArray<'local>> {
-        let desc = SyntaxSnapshotDesc::from_class(env, class)?;
-        let (old_snapshot, _) = desc.ref_from_java_object_impl(env, old_snapshot)?;
-        let (new_snapshot, _) = desc.ref_from_java_object_impl(env, new_snapshot)?;
-
-        let changed_ranges = old_snapshot.changed_ranges(new_snapshot);
-
-        let length = changed_ranges.len();
-        let range_desc = RangeDesc::new(env)?;
-        let array = env.new_object_array(length as i32, &range_desc.class, JObject::null())?;
-        for (i, range) in changed_ranges.enumerate() {
-            if i > length {
-                break;
-            }
-            let range_obj = range_desc.to_java_object(env, range)?;
-            let range_obj = env.auto_local(range_obj);
-            env.set_object_array_element(&array, i as i32, &range_obj)?;
-        }
-        Ok(array)
-    }
-    let result = inner(&mut env, class, old_snapshot, new_snapshot);
-    throw_exception_from_result(&mut env, result)
 }
 
 static INPUT_EDIT_METHODS: JOnceLock<InputEditMethods> = JOnceLock::new();

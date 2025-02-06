@@ -3,6 +3,7 @@ use std::{ffi::c_void, sync::OnceLock};
 use jni::{sys::jint, JavaVM};
 
 mod highlighting_lexer;
+mod injections;
 pub mod jni_utils;
 mod language_registry;
 mod predicates;
@@ -10,7 +11,8 @@ mod query;
 mod ranges;
 mod syntax_snapshot;
 
-pub use language_registry::{Language, LanguageId, with_language, with_language_by_name};
+pub use injections::InjectionQuery;
+pub use language_registry::{with_language, with_language_by_name, Language, LanguageId};
 pub use ranges::RangesQuery;
 
 pub(crate) static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();

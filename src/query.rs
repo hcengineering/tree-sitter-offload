@@ -1,4 +1,4 @@
-use tree_sitter::{Node, TextProvider};
+use tree_sitter::{Node, Range, TextProvider};
 
 pub struct RecodingUtf16TextProvider<'a> {
     text: &'a [u16],
@@ -42,7 +42,7 @@ impl Iterator for RecodingUtf16TextProviderIterator<'_> {
     }
 }
 
-impl<'a> TextProvider<Vec<u8>> for RecodingUtf16TextProvider<'a> {
+impl<'a> TextProvider<Vec<u8>> for &RecodingUtf16TextProvider<'a> {
     type I = RecodingUtf16TextProviderIterator<'a>;
 
     fn text(&mut self, node: Node) -> Self::I {
@@ -54,6 +54,42 @@ impl<'a> TextProvider<Vec<u8>> for RecodingUtf16TextProvider<'a> {
             start_offset,
             end_offset,
             ended: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CaptureOffset {
+    start_offset: i32,
+    end_offset: i32,
+}
+
+impl CaptureOffset {
+    pub fn new(start_offset: i32, end_offset: i32) -> Self {
+        Self {
+            start_offset,
+            end_offset,
+        }
+    }
+
+    pub fn apply_to_range(&self, range: &Range) -> Range {
+        let start_byte = ((range.start_byte as i32) + self.start_offset) as usize;
+        let end_byte = ((range.end_byte as i32) + self.start_offset) as usize;
+        let start_point = range.start_point;
+        let start_point = tree_sitter::Point {
+            row: start_point.row,
+            column: ((start_point.column as i32) + self.start_offset) as usize,
+        };
+        let end_point = range.end_point;
+        let end_point = tree_sitter::Point {
+            row: end_point.row,
+            column: ((end_point.column as i32) + self.end_offset) as usize,
+        };
+        Range {
+            start_byte,
+            end_byte,
+            start_point,
+            end_point,
         }
     }
 }

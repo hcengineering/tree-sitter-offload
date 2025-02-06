@@ -80,9 +80,9 @@ fn collect_ranges<'local, F: FnOnce(&Language) -> Option<Arc<RangesQuery>>>(
     use_inner: jboolean,
     query_selector: F,
 ) -> JNIResult<JObjectArray<'local>> {
-    let (snapshot, base_language_id) = SyntaxSnapshotDesc::from_java_object(env, snapshot)?;
+    let snapshot = SyntaxSnapshotDesc::from_java_object(env, snapshot)?;
     let range_desc = RangeDesc::new(env)?;
-    let Some(query) = with_language(base_language_id, query_selector)
+    let Some(query) = with_language(snapshot.base_language(), query_selector)
         .ok()
         .flatten()
     else {
@@ -97,13 +97,13 @@ fn collect_ranges<'local, F: FnOnce(&Language) -> Option<Arc<RangesQuery>>>(
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(((start_offset * 2) as usize)..((end_offset * 2) as usize));
     let text_provider = RecodingUtf16TextProvider::new(&text_buffer);
-    let mut text_provider2 = RecodingUtf16TextProvider::new(&text_buffer);
     let mut ranges: Vec<tree_sitter::Range> = Vec::new();
-    let mut matches = cursor.matches(&query.query, snapshot.tree.root_node(), text_provider);
+    let tree = snapshot.main_tree();
+    let mut matches = cursor.matches(&query.query, tree.root_node(), &text_provider);
     while let Some(query_match) = matches.next() {
         if !query
             .predicates
-            .satisfies_predicates(&mut text_provider2, query_match)
+            .satisfies_predicates(&mut &text_provider, query_match)
         {
             continue;
         }
