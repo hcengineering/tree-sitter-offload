@@ -1,10 +1,14 @@
 use std::{
+    borrow::Cow,
     collections::BinaryHeap,
     ops::Range,
     sync::{Arc, LazyLock, Mutex},
 };
 
-use crate::language_registry::{with_language, with_unknown_language, LanguageId, UnknownLanguage};
+use crate::{
+    injections::InjectionMatch,
+    language_registry::{with_language, with_unknown_language, LanguageId, UnknownLanguage},
+};
 
 mod jni_methods;
 pub use jni_methods::SyntaxSnapshotDesc;
@@ -51,6 +55,47 @@ struct ParseCommand {
     point_offset: ts::Point,
 }
 
+impl ParseCommand {
+    fn source_language(&self) -> Cow<'_, UnknownLanguage> {
+        match &self.language {
+            ParseCommandLanguage::Known(language_id) => {
+                let language_name: Box<str> =
+                    with_language(*language_id, |language| language.name().into())
+                        .unwrap_or_else(|_| format!("Language({language_id:?})").into());
+                Cow::Owned(UnknownLanguage::LanguageName(language_name))
+            }
+            ParseCommandLanguage::Unknown(unknown_language) => Cow::Borrowed(unknown_language),
+        }
+    }
+    fn language_id(&self) -> Option<LanguageId> {
+        match self.language {
+            ParseCommandLanguage::Known(language_id) => Some(language_id),
+            ParseCommandLanguage::Unknown(_) => None,
+        }
+    }
+
+    fn from_injection(injection: InjectionMatch, depth: usize) -> Self {
+        let language = with_unknown_language(&injection.language, |language| {
+            ParseCommandLanguage::Known(language.id())
+        })
+        .unwrap_or(ParseCommandLanguage::Unknown(injection.language));
+        let injection_start = injection
+            .included_ranges
+            .first()
+            .expect("injection always has at least one range");
+        let byte_offset = injection_start.start_byte;
+        let point_offset = injection_start.start_point;
+        Self {
+            depth,
+            language,
+            included_ranges: injection.included_ranges,
+            byte_range: injection.enclosing_byte_range,
+            byte_offset,
+            point_offset,
+        }
+    }
+}
+
 impl PartialOrd for ParseCommand {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -86,6 +131,20 @@ pub struct SyntaxSnapshotEntry {
     pub(crate) byte_range: Range<usize>,
     pub(crate) byte_offset: usize,
     pub(crate) point_offset: ts::Point,
+}
+
+impl SyntaxSnapshotEntry {
+    fn new_unparsed(parse_command: &ParseCommand) -> Self {
+        Self {
+            depth: parse_command.depth,
+            content: SyntaxSnapshotEntryContent::Unparsed(
+                parse_command.source_language().into_owned(),
+            ),
+            byte_range: parse_command.byte_range.clone(),
+            byte_offset: parse_command.byte_offset,
+            point_offset: parse_command.point_offset,
+        }
+    }
 }
 
 fn sub_point(point1: &ts::Point, point2: &ts::Point) -> ts::Point {
@@ -138,22 +197,10 @@ impl SyntaxSnapshot {
             byte_offset: 0,
             point_offset: ts::Point::default(),
         });
-        loop {
-            let Some(parse_command) = parse_queue.pop() else {
-                break;
-            };
-            let language_id = match parse_command.language {
-                ParseCommandLanguage::Known(language_id) => language_id,
-                ParseCommandLanguage::Unknown(unknown_language) => {
-                    entries.push(SyntaxSnapshotEntry {
-                        depth: parse_command.depth,
-                        content: SyntaxSnapshotEntryContent::Unparsed(unknown_language),
-                        byte_range: parse_command.byte_range,
-                        byte_offset: parse_command.byte_offset,
-                        point_offset: parse_command.point_offset,
-                    });
-                    continue;
-                }
+        while let Some(parse_command) = parse_queue.pop() {
+            let Some(language_id) = parse_command.language_id() else {
+                entries.push(SyntaxSnapshotEntry::new_unparsed(&parse_command));
+                continue;
             };
             let (ts_language, injections_query) = with_language(language_id, |language| {
                 (
@@ -162,7 +209,7 @@ impl SyntaxSnapshot {
                 )
             })
             .ok()?;
-            let mut included_ranges = parse_command.included_ranges;
+            let mut included_ranges = parse_command.included_ranges.clone();
             for range in &mut included_ranges {
                 range.start_byte -= parse_command.byte_offset;
                 range.start_point = sub_point(&range.start_point, &parse_command.point_offset);
@@ -176,51 +223,29 @@ impl SyntaxSnapshot {
                     &text[(parse_command.byte_range.start / 2)..(parse_command.byte_range.end / 2)];
                 parser.parse_utf16(text_slice, None)
             });
-            let content = if let Some(tree) = tree {
-                if let Some(injections_query) = injections_query {
-                    let node = tree.root_node_with_offset(
-                        parse_command.byte_offset,
-                        parse_command.point_offset,
-                    );
-                    let injections = injections_query.collect_injections(
-                        node,
-                        text,
-                        &[parse_command.byte_range.clone()],
-                    );
-                    for injection in injections {
-                        let language = with_unknown_language(&injection.language, |language| {
-                            ParseCommandLanguage::Known(language.id())
-                        })
-                        .unwrap_or(ParseCommandLanguage::Unknown(injection.language));
-                        let injection_start = injection
-                            .included_ranges
-                            .first()
-                            .expect("injection always has at least one range");
-                        let byte_offset = injection_start.start_byte;
-                        let point_offset = injection_start.start_point;
-                        parse_queue.push(ParseCommand {
-                            depth: parse_command.depth + 1,
-                            language,
-                            included_ranges: injection.included_ranges,
-                            byte_range: injection.enclosing_byte_range,
-                            byte_offset,
-                            point_offset,
-                        });
-                    }
-                }
-                SyntaxSnapshotEntryContent::Parsed {
-                    language: language_id,
-                    tree,
-                }
-            } else {
-                let language_name =
-                    with_language(language_id, |language| language.name().into()).ok()?;
-                SyntaxSnapshotEntryContent::Unparsed(UnknownLanguage::LanguageName(language_name))
+            let Some(tree) = tree else {
+                entries.push(SyntaxSnapshotEntry::new_unparsed(&parse_command));
+                continue;
             };
+            if let Some(injections_query) = injections_query {
+                let node = tree
+                    .root_node_with_offset(parse_command.byte_offset, parse_command.point_offset);
+                let injections = injections_query.collect_injections(
+                    node,
+                    text,
+                    &[parse_command.byte_range.clone()],
+                );
+                parse_queue.extend(injections.into_iter().map(|injection| {
+                    ParseCommand::from_injection(injection, parse_command.depth + 1)
+                }));
+            }
 
             let entry = SyntaxSnapshotEntry {
                 depth: parse_command.depth,
-                content,
+                content: SyntaxSnapshotEntryContent::Parsed {
+                    language: language_id,
+                    tree,
+                },
                 byte_range: parse_command.byte_range,
                 byte_offset: parse_command.byte_offset,
                 point_offset: parse_command.point_offset,
@@ -265,22 +290,10 @@ impl SyntaxSnapshot {
             byte_offset: 0,
             point_offset: ts::Point::default(),
         });
-        loop {
-            let Some(parse_command) = parse_queue.pop() else {
-                break;
-            };
-            let language_id = match parse_command.language {
-                ParseCommandLanguage::Known(language_id) => language_id,
-                ParseCommandLanguage::Unknown(unknown_language) => {
-                    entries.push(SyntaxSnapshotEntry {
-                        depth: parse_command.depth,
-                        content: SyntaxSnapshotEntryContent::Unparsed(unknown_language),
-                        byte_range: parse_command.byte_range,
-                        byte_offset: parse_command.byte_offset,
-                        point_offset: parse_command.point_offset,
-                    });
-                    continue;
-                }
+        while let Some(parse_command) = parse_queue.pop() {
+            let Some(language_id) = parse_command.language_id() else {
+                entries.push(SyntaxSnapshotEntry::new_unparsed(&parse_command));
+                continue;
             };
             let (ts_language, injections_query) = with_language(language_id, |language| {
                 (
@@ -311,7 +324,7 @@ impl SyntaxSnapshot {
                     };
                 }
             }
-            let mut included_ranges = parse_command.included_ranges;
+            let mut included_ranges = parse_command.included_ranges.clone();
             for range in &mut included_ranges {
                 range.start_byte -= parse_command.byte_offset;
                 range.start_point = sub_point(&range.start_point, &parse_command.point_offset);
@@ -325,57 +338,35 @@ impl SyntaxSnapshot {
                     &text[(parse_command.byte_range.start / 2)..(parse_command.byte_range.end / 2)];
                 parser.parse_utf16(text_slice, old_tree.as_ref())
             });
-            let content = if let Some(tree) = tree {
-                if let Some(old_tree) = old_tree {
-                    let new_changed_ranges = old_tree.changed_ranges(&tree);
-                    changed_ranges.extend(new_changed_ranges);
-                } else {
-                    changed_ranges.extend(included_ranges);
-                }
-                if let Some(injections_query) = injections_query {
-                    let node = tree.root_node_with_offset(
-                        parse_command.byte_offset,
-                        parse_command.point_offset,
-                    );
-                    let injections = injections_query.collect_injections(
-                        node,
-                        text,
-                        &[parse_command.byte_range.clone()],
-                    );
-                    for injection in injections {
-                        let language = with_unknown_language(&injection.language, |language| {
-                            ParseCommandLanguage::Known(language.id())
-                        })
-                        .unwrap_or(ParseCommandLanguage::Unknown(injection.language));
-                        let injection_start = injection
-                            .included_ranges
-                            .first()
-                            .expect("injection always has at least one range");
-                        let byte_offset = injection_start.start_byte;
-                        let point_offset = injection_start.start_point;
-                        parse_queue.push(ParseCommand {
-                            depth: parse_command.depth + 1,
-                            language,
-                            included_ranges: injection.included_ranges,
-                            byte_range: injection.enclosing_byte_range,
-                            byte_offset,
-                            point_offset,
-                        });
-                    }
-                }
-                SyntaxSnapshotEntryContent::Parsed {
-                    language: language_id,
-                    tree,
-                }
-            } else {
-                let language_name =
-                    with_language(language_id, |language| language.name().into()).ok()?;
-                SyntaxSnapshotEntryContent::Unparsed(UnknownLanguage::LanguageName(language_name))
+            let Some(tree) = tree else {
+                entries.push(SyntaxSnapshotEntry::new_unparsed(&parse_command));
+                continue;
             };
+            if let Some(old_tree) = old_tree {
+                let new_changed_ranges = old_tree.changed_ranges(&tree);
+                changed_ranges.extend(new_changed_ranges);
+            } else {
+                changed_ranges.extend(included_ranges);
+            }
+            if let Some(injections_query) = injections_query {
+                let node = tree
+                    .root_node_with_offset(parse_command.byte_offset, parse_command.point_offset);
+                let injections = injections_query.collect_injections(
+                    node,
+                    text,
+                    &[parse_command.byte_range.clone()],
+                );
+                parse_queue.extend(injections.into_iter().map(|injection| {
+                    ParseCommand::from_injection(injection, parse_command.depth + 1)
+                }));
+            }
 
             let entry = SyntaxSnapshotEntry {
                 depth: parse_command.depth,
-                content,
+                content: SyntaxSnapshotEntryContent::Parsed {
+                    language: language_id,
+                    tree,
+                },
                 byte_range: parse_command.byte_range,
                 byte_offset: parse_command.byte_offset,
                 point_offset: parse_command.point_offset,
