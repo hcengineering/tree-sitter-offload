@@ -79,6 +79,12 @@ impl<'local> SyntaxSnapshotDesc<'local> {
         env: &mut JNIEnv<'local>,
         snapshot: JObject<'local>,
     ) -> JNIResult<&'local SyntaxSnapshot> {
+        if !env.is_instance_of(&snapshot, &self.class)? {
+            return Err(JNIError::FieldNotFound {
+                name: "handle".to_string(),
+                sig: "long".to_string(),
+            });
+        }
         let handle = env.get_field_unchecked(
             &snapshot,
             self.inner.handle_field,
