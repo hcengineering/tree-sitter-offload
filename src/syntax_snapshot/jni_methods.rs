@@ -10,6 +10,7 @@ use jni::{
 use crate::{
     jni_utils::{throw_exception_from_result, PointDesc, RangeDesc},
     language_registry::LanguageId,
+    syntax_snapshot::SyntaxSnapshotTreeCursor,
 };
 
 use super::SyntaxSnapshot;
@@ -311,4 +312,41 @@ impl InputEditMethods {
             new_end_position,
         })
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntaxSnapshot_nativeFindNodeRangeAt<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    snapshot: JObject<'local>,
+    offset: i32,
+) -> JObject<'local> {
+    fn inner<'local>(
+        env: &mut JNIEnv<'local>,
+        snapshot: JObject<'local>,
+        offset: i32,
+    ) -> JNIResult<JObject<'local>> {
+        let snapshot = SyntaxSnapshotDesc::from_java_object(env, snapshot)?;
+        let mut cursor = SyntaxSnapshotTreeCursor::walk(snapshot);
+        let byte_offset = (offset as usize) * 2;
+        println!("Byte offset {byte_offset}");
+        while let Some(_) = cursor.goto_first_child_for_byte(byte_offset) {
+            println!("Node {:?} {:?}", cursor.node(), cursor.node().byte_range());
+        }
+
+        while cursor.node().start_byte() > byte_offset {
+            if !cursor.goto_previous_sibling() {
+                break;
+            }
+        }
+
+        let node = cursor.node();
+        if node.start_byte() <= byte_offset && byte_offset < node.end_byte() && node.is_named() {
+            return RangeDesc::new(env)?.to_java_object(env, node.range());
+        }
+        Ok(JObject::null())
+    }
+    let result = inner(&mut env, snapshot, offset);
+    throw_exception_from_result(&mut env, result)
 }
