@@ -428,10 +428,11 @@ impl<'cursor> SyntaxSnapshotTreeCursor<'cursor> {
         if let Some(child) = cursor.goto_first_child_for_byte(index) {
             return Some(child);
         } else {
+            let node_range = cursor.node().byte_range();
             let candidate_entry = self.snapshot.entries.iter().enumerate().find(|(_, e)| {
                 e.depth == entry.depth + 1
-                    && e.byte_range.start >= entry.byte_range.start
-                    && e.byte_range.end <= entry.byte_range.end
+                    && e.byte_range.start >= node_range.start
+                    && e.byte_range.end <= node_range.end
                     && index < entry.byte_range.end
             });
             if let Some((idx, entry)) = candidate_entry {
