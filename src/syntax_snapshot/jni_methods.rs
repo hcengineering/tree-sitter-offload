@@ -336,9 +336,7 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
         let snapshot = SyntaxSnapshotDesc::from_java_object(env, snapshot)?;
         let mut cursor = SyntaxSnapshotTreeCursor::walk(snapshot);
         let byte_offset = (offset as usize) * 2;
-        println!("Byte offset {byte_offset}");
         while let Some(_) = cursor.goto_first_child_for_byte(byte_offset) {
-            println!("Node {:?} {:?}", cursor.node(), cursor.node().byte_range());
         }
 
         while cursor.node().start_byte() > byte_offset {
