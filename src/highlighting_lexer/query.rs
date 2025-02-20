@@ -212,6 +212,13 @@ pub fn highlight_tokens_cover(
                     }
                 }
             } else {
+                if byte_current < node.start_byte() {
+                    highlight_tokens.push(token_from_node_subrange(
+                        byte_current..node.start_byte(),
+                        tree_cursor.language(),
+                        &highlight_stack,
+                    ));
+                }
                 highlight_tokens.push(token_from_node(
                     node,
                     tree_cursor.language(),
