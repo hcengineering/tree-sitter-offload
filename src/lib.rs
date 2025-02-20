@@ -1,4 +1,4 @@
-use std::{ffi::c_void, sync::OnceLock};
+use std::ffi::c_void;
 
 use jni::{sys::jint, JavaVM};
 
@@ -15,8 +15,6 @@ pub use injections::InjectionQuery;
 pub use language_registry::{with_language, with_language_by_name, Language, LanguageId};
 pub use ranges::RangesQuery;
 
-pub(crate) static JAVA_VM: OnceLock<JavaVM> = OnceLock::new();
-
 unsafe extern "system" {
     // Linked from tree-sitter-ng, registers native methods for it
     fn tree_sitter_ng_JNI_OnLoad(vm: *mut jni::sys::JavaVM, reserved: *const c_void) -> jint;
@@ -27,8 +25,6 @@ unsafe extern "system" {
 #[no_mangle]
 pub unsafe extern "system" fn JNI_OnLoad(vm: JavaVM, reserved: *const c_void) -> jint {
     let val = unsafe { tree_sitter_ng_JNI_OnLoad(vm.get_java_vm_pointer(), reserved) };
-
-    JAVA_VM.set(vm).unwrap();
 
     jni::sys::JNI_VERSION_1_2.max(val)
 }
