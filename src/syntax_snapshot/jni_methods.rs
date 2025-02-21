@@ -336,8 +336,7 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
         let snapshot = SyntaxSnapshotDesc::from_java_object(env, snapshot)?;
         let mut cursor = SyntaxSnapshotTreeCursor::walk(snapshot);
         let byte_offset = (offset as usize) * 2;
-        while let Some(_) = cursor.goto_first_child_for_byte(byte_offset) {
-        }
+        while let Some(_) = cursor.goto_first_child_for_byte(byte_offset) {}
 
         while cursor.node().start_byte() > byte_offset {
             if !cursor.goto_previous_sibling() {
@@ -346,8 +345,11 @@ pub extern "system" fn Java_com_hulylabs_treesitter_rusty_TreeSitterNativeSyntax
         }
 
         let node = cursor.node();
-        if node.start_byte() <= byte_offset && byte_offset < node.end_byte() && node.is_named() {
-            return RangeDesc::new(env)?.to_java_object(env, node.range());
+        if node.start_byte() <= byte_offset && byte_offset < node.end_byte() {
+            let range = RangeDesc::new(env)?.to_java_object(env, node.range())?;
+            let named = node.is_named();
+            let named = env.new_object("java/lang/Boolean", "(Z)V", &[JValue::from(named)])?;
+            return PairDesc::new(env)?.to_java_object(env, (range, named));
         }
         Ok(JObject::null())
     }
