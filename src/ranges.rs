@@ -77,7 +77,7 @@ fn collect_ranges(
     query: &RangesQuery,
     text: &[u16],
     byte_range: Range<usize>,
-    use_inner: bool,
+    mut use_inner: bool,
 ) -> Vec<(usize, tree_sitter::Range)> {
     let mut ranges = Vec::new();
     let mut cursor = QueryCursor::new();
@@ -107,6 +107,11 @@ fn collect_ranges(
                 end_point = Some(node.end_position());
             }
         }
+        use_inner |= query
+            .query
+            .property_settings(query_match.pattern_index)
+            .iter()
+            .any(|p| p.key.as_ref() == "range.inner");
         for capture in query_match.captures {
             if Some(capture.index) == query.start_capture_id {
                 if use_inner {
