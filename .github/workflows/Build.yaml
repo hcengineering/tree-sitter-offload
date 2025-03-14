@@ -26,12 +26,18 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
+    - name: Install rustup x86_64 target
+      run: rustup target add x86_64-apple-darwin
     - name: Build
-      run: cargo build --release
+      run: |
+        cargo build --release
+        cargo build --release --target x86_64-apple-darwin
     - uses: actions/upload-artifact@v4
       with:
         name: cdylib-macos
-        path: target/release/*.dylib
+        path: |
+          target/release/*.dylib
+          target/x86_64-apple-darwin/release/*.dylib
 
   build-windows:
     runs-on: windows-latest
@@ -63,7 +69,8 @@ jobs:
       run: |
         rm -f tree-sitter-ng/tree-sitter/src/main/resources/lib/*
         cp dylibs/libtree_sitter_offload.so tree-sitter-ng/tree-sitter/src/main/resources/lib/x86_64-linux-gnu-tree-sitter.so
-        cp dylibs/libtree_sitter_offload.dylib tree-sitter-ng/tree-sitter/src/main/resources/lib/aarch64-macos-tree-sitter.dylib
+        cp dylibs/release/libtree_sitter_offload.dylib tree-sitter-ng/tree-sitter/src/main/resources/lib/aarch64-macos-tree-sitter.dylib
+        cp dylibs/x86_64-apple-darwin/release/libtree_sitter_offload.dylib tree-sitter-ng/tree-sitter/src/main/resources/lib/x86_64-macos-tree-sitter.dylib
         cp dylibs/tree_sitter_offload.dll tree-sitter-ng/tree-sitter/src/main/resources/lib/x86_64-windows-tree-sitter.dll
     - name: Build jar
       working-directory: ./tree-sitter-ng/
